@@ -1,1 +1,1 @@
-Description rapide du projet.
+This Github repository is created following the work at my internship at Hopital des Quinze-Vingts. I developped a RNN model to automatically segment series of images from patients suffering from dry AMD.
