@@ -1,0 +1,58 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- Environnements ---
+.venv/
+.env
+*.env
+.conda/
+ipykernel_*
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Caches / logs ---
+*.log
+*.tmp
+*.bak
+.cache/
+pip-wheel-metadata/
+**/__pycache__/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Données & sorties locales (adapter selon ton projet) ---
+data/
+datasets/
+raw_data/
+outputs/
+results/
+reports/
+figures/
+checkpoints/
+runs/
+# Modèles lourds
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.pkl
+*.npz
+
+# --- Images volumineuses (si non nécessaires dans le repo) ---
+*.tif
+*.tiff
+*.nii
+*.nii.gz
+*.dcm
