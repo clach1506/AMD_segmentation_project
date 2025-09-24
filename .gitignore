@@ -31,16 +31,9 @@ pip-wheel-metadata/
 # --- Notebooks ---
 .ipynb_checkpoints/
 
-# --- Données & sorties locales (adapter selon ton projet) ---
-data/
-datasets/
-raw_data/
-outputs/
-results/
-reports/
-figures/
-checkpoints/
-runs/
+# --- Données & sorties locales ---
+test_data/
+
 # Modèles lourds
 *.pt
 *.pth
