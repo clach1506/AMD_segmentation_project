@@ -2,9 +2,12 @@
 import torch, numpy as np, torch.functional as F, tkinter as tk
 from PIL import Image
 from pathlib import Path
+import matplotlib.cm as cm
+
 
 from tkinter import filedialog
 
+from scipy.io import savemat, loadmat
 from scipy.ndimage import gaussian_filter,distance_transform_edt
 from skimage.morphology import remove_small_objects
 
@@ -289,7 +292,6 @@ def segment_series(
     print(f"{T_orig} segmentations saved in folder: {outdir}")
     return str(outdir)
 
-
 def segment_series_distance(
     model,
     T: int = 16,
@@ -411,4 +413,215 @@ def segment_series_distance(
     # ➜ Retourne uniquement le chemin du dossier (string)
     return str(outdir)
 
- 
+def segment_series_to_colormap(
+    model,
+    model_type: str = "pixel",         # "pixel" ou "patch"
+    T: int = 16,
+    device: str = "cpu",
+    threshold: float = 0.5,
+    min_duration: int = 3,
+    min_size: int = 20,
+    sigma: float = 0.0,
+    smooth_temporal: bool = False,
+    batch_size: int = 1024,
+    seg_prefix: str = "seg_",
+    folder_name: str = "SEG_",
+    stride: int = 8,
+    cmap_name: str = "turbo",          # << nom de la colormap
+    absolute_index: bool = False,      # False: index relatif à la fenêtre ; True: index absolu global
+    save_indices_tiff: bool = True,    # Sauver aussi la carte d'indices (int16)
+):
+    """
+    Segmente en sous-séries chevauchantes et sauvegarde UNE colormap d'onset par sous-série.
+    - La couleur encode l'instant (frame) où le pixel passe en GA (premier 1 après filtres).
+    - Les pixels sans apparition gardent l'alpha 0 (transparent) et sont -1 dans le TIFF.
+    """
+    assert model_type in ("pixel", "patch")
+    assert stride >= 1
+
+    # ---- 1) Sélection & chargement ----
+    root = tk.Tk(); root.withdraw()
+    image_dir = filedialog.askdirectory(title="Select images folder")
+    if not image_dir:
+        raise RuntimeError("No selected folder")
+    series_full = load_ir_images(image_dir)  # (T0,H,W) normalisées
+    if series_full.ndim != 3:
+        raise ValueError(f"load_ir_images doit renvoyer (T,H,W), obtenu {series_full.shape}")
+
+    T0, H, W = series_full.shape
+
+    # ---- 2) Dossier racine de sortie ----
+    out_root = Path(image_dir).parent / folder_name
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # ---- 3) Fenêtres (garantir >= stride frames utiles sur la dernière) ----
+    starts = [0]
+    while starts[-1] + T < T0:
+        nxt = starts[-1] + stride
+        if nxt >= T0: break
+        starts.append(nxt)
+    if starts[-1] + T < T0 and (T0 - stride) > starts[-1]:
+        starts.append(T0 - stride)
+
+    # Pré-colormap
+    try:
+        cmap = cm.get_cmap(cmap_name)
+    except Exception as e:
+        raise ValueError(f"Colormap '{cmap_name}' introuvable dans Matplotlib.") from e
+
+    total_saved = 0
+
+    for w_idx, s in enumerate(starts, start=1):
+        e = min(s + T, T0)
+        sub = series_full[s:e]      # (L,H,W)
+        L = sub.shape[0]
+
+        # Padding pour constituer des fenêtres de taille T pour le modèle
+        if L < T:
+            pad = np.zeros((T - L, H, W), dtype=sub.dtype)
+            series_pad = np.concatenate([sub, pad], axis=0)   # (T,H,W)
+        else:
+            series_pad = sub
+
+        # ---- Validité & bords (par fenêtre) ----
+        mask_valid = compute_validity_mask(series_pad, threshold=0)  # (H,W)
+        vi, vj = np.where(mask_valid)
+
+        if model_type == "patch":
+            patch_size = 3
+            off = patch_size // 2
+            keep = (vi >= off) & (vi < H - off) & (vj >= off) & (vj < W - off)
+            vi, vj = vi[keep], vj[keep]
+
+        if vi.size == 0:
+            # crée quand même le dossier seg et passe
+            (out_root / f"seg{w_idx}").mkdir(parents=True, exist_ok=True)
+            continue
+
+        # ---- Features ----
+        if model_type == "pixel":
+            X = series_pad[:, vi, vj].transpose(1, 0)[:, :, None].astype(np.float32)  # (N,T,1)
+        else:
+            off = patch_size // 2
+            patches = [
+                series_pad[:, vi + di, vj + dj]
+                for di in range(-off, off + 1)
+                for dj in range(-off, off + 1)
+            ]
+            X = np.stack(patches, axis=-1).transpose(1, 0, 2).astype(np.float32)      # (N,T,P)
+
+        # ---- Probas (N,T) -> ne garder que L frames utiles ----
+        probs = predict_on_subseries(
+            model, X, device=device, smooth=smooth_temporal,
+            batch_size=batch_size, return_proba=True
+        )[:, :L]  # (N,L)
+
+        # ---- Lissage spatial optionnel AVANT seuillage (frame-wise) ----
+        if sigma and sigma > 0:
+            # Reprojeter temporairement pour filtrer en 2D
+            prob_cube = np.zeros((L, H, W), dtype=np.float32)
+            for t_rel in range(L):
+                prob_cube[t_rel, vi, vj] = probs[:, t_rel]
+            prob_cube = gaussian_filter(prob_cube, sigma=(0, sigma, sigma))
+            # Retour (N,L)
+            probs = prob_cube[:, vi, vj].T
+
+        # ---- Seuillage & min_duration (par pixel, sur la fenêtre) ----
+        y_bin = (probs >= float(threshold)).astype(np.uint8)  # (N,L)
+        if min_duration and min_duration > 1:
+            y_bin = enforce_min_duration(y_bin, min_duration)  # (N,L)
+
+        # ---- Suppression petites composantes (frame-wise) ----
+        if min_size and min_size > 0:
+            # Reprojeter pour opérer par frame, puis re-extraire
+            bin_cube = np.zeros((L, H, W), dtype=bool)
+            for t_rel in range(L):
+                bin_cube[t_rel, vi, vj] = y_bin[:, t_rel].astype(bool)
+                bin_cube[t_rel] = remove_small_objects(bin_cube[t_rel], min_size=min_size)
+            y_bin = bin_cube[:, vi, vj].T  # (N,L) bool
+
+        # ---- Calcul de l'ONSET (premier True) ----
+        # has_onset: (N,), first_idx: (N,), retourne 0 si pas de True ⇒ attention
+        has_onset = y_bin.any(axis=1)
+        first_idx = y_bin.argmax(axis=1)  # premier index de True OU 0 si aucun
+
+        # Construire la carte d'indices (H,W) avec -1 = pas d'apparition
+        onset_idx = np.full((H, W), -1, dtype=np.int16)
+
+        if absolute_index:
+            # index absolu dans la série globale
+            onset_vals = (s + first_idx[has_onset]).astype(np.int32)
+            onset_idx[vi[has_onset], vj[has_onset]] = onset_vals
+            norm_den = max(T0 - 1, 1)
+            norm = onset_vals.astype(np.float32) / norm_den
+            # Pour normaliser toute l'image, on créera plus bas une carte normalisée complète
+        else:
+            # index relatif à la fenêtre [0..L-1]
+            onset_vals = first_idx[has_onset].astype(np.int32)
+            onset_idx[vi[has_onset], vj[has_onset]] = onset_vals
+            norm_den = max(L - 1, 1)
+
+        # ---- Conversion en image couleur (RGBA), pixels “sans apparition” transparents ----
+        # Carte normalisée 0..1 pour les pixels ayant une apparition :
+        onset_norm = np.zeros((H, W), dtype=np.float32)
+        if absolute_index:
+            # Normaliser par la longueur globale
+            valid_abs = onset_idx >= 0
+            onset_norm[valid_abs] = (onset_idx[valid_abs].astype(np.float32)) / max(T0 - 1, 1)
+        else:
+            valid_rel = onset_idx >= 0
+            onset_norm[valid_rel] = (onset_idx[valid_rel].astype(np.float32)) / norm_den
+
+        rgba = np.zeros((H, W, 4), dtype=np.float32)
+        if (onset_norm > 0).any() or (onset_idx == 0).any():
+            rgba_colors = cmap(onset_norm)  # (H,W,4), alpha=1 par défaut
+            rgba[onset_idx >= 0] = rgba_colors[onset_idx >= 0]
+            rgba[onset_idx >= 0, 3] = 1.0   # alpha plein sur pixels avec apparition
+            rgba[onset_idx <  0, 3] = 0.0   # transparent ailleurs
+
+        # ---- Sauvegarde dans seg{w_idx} ----
+        seg_dir = out_root / f"seg{w_idx}"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) PNG couleur (RGBA) de la colormap
+        # Convertir en 8-bit
+        rgba8 = (np.clip(rgba, 0, 1) * 255).astype(np.uint8)
+        Image.fromarray(rgba8, mode="RGBA").save(seg_dir / "onset_colormap.png")
+
+        # 2) (optionnel) TIFF d'indices (int16) pour analyses
+        if save_indices_tiff:
+            # Sauve en TIFF grayscale 16 bits signé : via Pillow -> utiliser mode 'I;16' nécessite non signé.
+            # On convertit en int16, puis décalage +32768 pour stocker en uint16 (restaurable).
+            onset_u16 = (onset_idx.astype(np.int32) + 32768).astype(np.uint16)
+            Image.fromarray(onset_u16, mode="I;16").save(seg_dir / "onset_indices.tiff")
+
+        total_saved += 1
+
+    print(f"{total_saved} onset colormaps saved in folder: {out_root}")
+    return str(out_root)
+
+## After Processing and helpers
+
+def pngs_to_mat(input_folder, output_matfile, var_name="MASK"):
+
+    """This function takes as input a folder with n png binary images of size (H,W)
+      and transforms them into a unique matlab folder of size (n, H, W)"""
+    
+    image_files = sorted([f for f in os.listdir(input_folder) if f.endswith(".png")])
+
+    first_image = Image.open(os.path.join(input_folder, image_files[0])).convert("L")
+    height, width = first_image.size[::-1]
+    num_images = len(image_files)
+    image_stack = np.zeros((num_images, height, width), dtype=np.uint8)
+
+    for i, file in enumerate(image_files):
+        img = Image.open(os.path.join(input_folder, file)).convert("L")
+        binary = np.array(img) > 127  # binaire 0/1
+        image_stack[i] = binary.astype(np.uint8)
+
+    print("Final shape (T, H, W):", image_stack.shape)
+    savemat(output_matfile, {var_name: image_stack})
+    print(f"Saved {num_images} images to '{output_matfile}' as variable '{var_name}'.")
+
+
+

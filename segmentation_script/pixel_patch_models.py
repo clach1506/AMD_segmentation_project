@@ -1,18 +1,13 @@
 #### 1- Importation
 
-import sys, torch, os, glob, re, tkinter as tk, numpy as np
-from tkinter import filedialog
-from PIL import Image
-from scipy.ndimage import gaussian_filter,distance_transform_edt
-from skimage.morphology import remove_small_objects
-
-
+import sys, torch
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from models.rnn import FlexibleGRU
 from utils import (
     load_model,
-    segment_series
+    segment_series,
+    segment_series_to_colormap
 )
 
 #### 2- Loading of the different models configurations 
@@ -34,15 +29,13 @@ model_pixel = load_model(pixel_model_path, model_class=FlexibleGRU, device=devic
                    input_size=1, hidden_size=64, num_layers=2)
 model_patch = load_model(patch_model__path, model_class=FlexibleGRU, device=device,
                    input_size=9, hidden_size=64, num_layers=2)
-model_distance = load_model(distance_model_path, model_class=FlexibleGRU, device=device,
-                   input_size=2, hidden_size=64, num_layers=2 )
 
 
 #### 3- Segmentation function call
 
 outdir = segment_series(
-    model=model_pixel,        
-    model_type="pixel",       # "pixel" / "patch"
+    model=model_patch,        
+    model_type="patch",       # "pixel" / "patch"
     T=16,
     device="cpu",          
     threshold=0.5,
@@ -50,10 +43,10 @@ outdir = segment_series(
     min_size=20,
     sigma=0.7,
     smooth_temporal=False,
-    batch_size= 128,
+    batch_size= 1024,
     seg_prefix="seg_",
-    folder_name="seg_pixel_model",
-    seg_mode = "L"
+    folder_name="seg_patch_model",
+    seg_mode="L"
     )
 
 print("Binary masks saved in folder :", outdir)
