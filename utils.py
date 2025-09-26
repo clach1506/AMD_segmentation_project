@@ -1,5 +1,5 @@
 
-import torch, numpy as np, torch.functional as F, tkinter as tk
+import torch, numpy as np, torch.functional as F, tkinter as tk, os
 from PIL import Image
 from pathlib import Path
 import matplotlib.cm as cm
@@ -171,7 +171,7 @@ def enforce_min_duration(y_bin: np.ndarray, min_duration: int) -> np.ndarray:
 
 ## Core functions : segmentations of image series
 
-def segment_series(
+def segment_series2(
     model,                             # modèle PyTorch (pixel OU patch)
     model_type: str = "pixel",         # "pixel" ou "patch"
     T: int = 16,
@@ -292,7 +292,7 @@ def segment_series(
     print(f"{T_orig} segmentations saved in folder: {outdir}")
     return str(outdir)
 
-def segment_series_distance(
+def segment_series_distance2(
     model,
     T: int = 16,
     device: str = "cpu",
@@ -430,6 +430,8 @@ def segment_series_to_colormap(
     cmap_name: str = "turbo",          # << nom de la colormap
     absolute_index: bool = False,      # False: index relatif à la fenêtre ; True: index absolu global
     save_indices_tiff: bool = True,    # Sauver aussi la carte d'indices (int16)
+    input_folder="input_folder",
+    output_dir="output_root"
 ):
     """
     Segmente en sous-séries chevauchantes et sauvegarde UNE colormap d'onset par sous-série.
@@ -440,18 +442,15 @@ def segment_series_to_colormap(
     assert stride >= 1
 
     # ---- 1) Sélection & chargement ----
-    root = tk.Tk(); root.withdraw()
-    image_dir = filedialog.askdirectory(title="Select images folder")
-    if not image_dir:
-        raise RuntimeError("No selected folder")
-    series_full = load_ir_images(image_dir)  # (T0,H,W) normalisées
+
+    series_full = load_ir_images(input_folder)  # (T0,H,W) normalisées
     if series_full.ndim != 3:
         raise ValueError(f"load_ir_images doit renvoyer (T,H,W), obtenu {series_full.shape}")
 
     T0, H, W = series_full.shape
 
     # ---- 2) Dossier racine de sortie ----
-    out_root = Path(image_dir).parent / folder_name
+    out_root = Path(output_dir) / folder_name
     out_root.mkdir(parents=True, exist_ok=True)
 
     # ---- 3) Fenêtres (garantir >= stride frames utiles sur la dernière) ----
@@ -492,11 +491,6 @@ def segment_series_to_colormap(
             off = patch_size // 2
             keep = (vi >= off) & (vi < H - off) & (vj >= off) & (vj < W - off)
             vi, vj = vi[keep], vj[keep]
-
-        if vi.size == 0:
-            # crée quand même le dossier seg et passe
-            (out_root / f"seg{w_idx}").mkdir(parents=True, exist_ok=True)
-            continue
 
         # ---- Features ----
         if model_type == "pixel":
@@ -580,8 +574,7 @@ def segment_series_to_colormap(
             rgba[onset_idx <  0, 3] = 0.0   # transparent ailleurs
 
         # ---- Sauvegarde dans seg{w_idx} ----
-        seg_dir = out_root / f"seg{w_idx}"
-        seg_dir.mkdir(parents=True, exist_ok=True)
+        seg_dir = out_root 
 
         # 1) PNG couleur (RGBA) de la colormap
         # Convertir en 8-bit
@@ -625,3 +618,236 @@ def pngs_to_mat(input_folder, output_matfile, var_name="MASK"):
 
 
 
+def segment_series(
+    model,                             # modèle PyTorch (pixel OU patch)
+    model_type: str = "pixel",         # "pixel" ou "patch"
+    T: int = 16,
+    device: str = "cpu",
+    threshold: float = 0.5,            # seuil de binarisation
+    min_duration: int = 3,             # 0 pour désactiver
+    min_size: int = 20,                # 0 pour désactiver
+    sigma: float = 0.0,                # 0 pour désactiver (lissage spatial des probas)
+    smooth_temporal: bool = False,     # lissage temporel dans predict_on_subseries
+    batch_size: int = 1024,
+    seg_prefix: str = "seg_",
+    folder_name : str = "SEG_",
+    seg_mode: str = "L",
+    input_folder="input_folder",
+    output_dir="output_root"
+):
+    """
+    This function opens a windows to select a folder of images IR to segment, the images must be already normalized to ensure coherent results.
+    This functions uses a pixel-pretrained model or a patch-pretrained model as wanted. 
+    Several parameters can be used : 
+    - Model type : ie pixel or patch (patch usually offers better results)
+    - Threshold : threshold used to binarize prediction of the model 
+    - Min Duration : keep only runs of 1s with length >= min_duration, per pixel row
+    - Min size : keep only regions of pixels with size >= min_size
+    - sigma : Gaussian blur
+    - Smooth_temporal : (bool) used to smooth predictions 
+    - Batch size
+    - Seg_prefix : name of the segmented images + index 
+    """
+    assert model_type in ("pixel", "patch"), "model_type must be 'pixel' or 'patch'"
+
+   
+    series = load_ir_images(input_folder)  # <-- ta fonction
+    if series.ndim != 3:
+        raise ValueError(f"load_ir_images doit renvoyer (T,H,W), obtenu {series.shape}")
+
+    T_orig, H, W = series.shape
+
+    # ---- 2) Padding of short series or division in subseries ----
+    if T_orig < T:
+        pad = T - T_orig
+        series_pad = np.concatenate([series, np.zeros((pad, H, W), dtype=series.dtype)], axis=0)
+    else:
+        series_pad = series[:T]
+    T_eff = series_pad.shape[0]
+
+    # ---- 3) Validity mask to keep only relevant regions ----
+    mask_valid = compute_validity_mask(series_pad, threshold=0)  # (H, W) bool
+    vi, vj = np.where(mask_valid)
+
+    # ---- 4) Eliminate borders when patch model is activated ----
+    if model_type == "patch":
+        patch_size = 3
+        off = patch_size // 2
+        keep = (vi >= off) & (vi < H - off) & (vj >= off) & (vj < W - off)
+        vi, vj = vi[keep], vj[keep]
+
+    if vi.size == 0:
+        raise ValueError("No valid pixels found for inference.")
+
+    # ---- 5) Features extraction according to model type ----
+    if model_type == "pixel":
+        X = series_pad[:, vi, vj].transpose(1, 0)[:, :, None]         # (N, T_eff, 1)
+    else:
+        off = patch_size // 2
+        patches = [
+            series_pad[:, vi + di, vj + dj]
+            for di in range(-off, off + 1)
+            for dj in range(-off, off + 1)
+        ]
+        X = np.stack(patches, axis=-1).transpose(1, 0, 2)             # (N, T_eff, P)
+
+    # ---- 6) Predictions in proba ----
+    probs = predict_on_subseries(
+        model, X, device=device, smooth=smooth_temporal,
+        batch_size=batch_size, return_proba=True
+    )[:, :T_eff]
+
+    # ---- 7) Binarization of predictions + duration constraint ----
+    y_bin = (probs >= float(threshold)).astype(np.uint8)
+    if min_duration and min_duration > 1:
+        y_bin = enforce_min_duration(y_bin, min_duration)  # (N, T_eff)
+
+    # ---- 8) Reprojection spatio-temporelle ----
+    prob_cube = np.zeros((T_eff, H, W), dtype=np.float32)
+    bin_cube  = np.zeros((T_eff, H, W), dtype=bool)
+    for t in range(T_eff):
+        prob_cube[t, vi, vj] = probs[:, t]
+        bin_cube[t,  vi, vj] = y_bin[:, t].astype(bool)
+
+    # ---- 9) Gaussian filter + removing of smaller objects ----
+    masks_bin = np.zeros_like(bin_cube)
+    for t in range(T_eff):
+        frame_bin = bin_cube[t]
+        if sigma and sigma > 0:
+            smoothed = gaussian_filter(prob_cube[t], sigma=sigma)
+            frame_bin = smoothed >= threshold
+        if min_size and min_size > 0:
+            frame_bin = remove_small_objects(frame_bin, min_size=min_size)
+        masks_bin[t] = frame_bin
+
+    # ---- 10) Elimination of padding frames ----
+    masks_bin = masks_bin[:T_orig]  # (T_orig, H, W) bool
+
+    # ---- 11) Saving of images in folder <image_dir>/SEG_<model_type> ----
+    outdir = Path(output_dir) / folder_name
+    outdir.mkdir(parents=True, exist_ok=True)
+    for t in range(T_orig):
+        arr = (masks_bin[t].astype(np.uint8) * 255)
+        img = Image.fromarray(arr, mode="L")
+        if seg_mode == "1":
+            img = img.convert("1")
+        img.save(outdir / f"{seg_prefix}{t+1:04d}.png")
+
+    print(f"{T_orig} segmentations saved in folder: {outdir}")
+    return str(outdir)
+
+# utils_distance.py (ou dans utils.py si tu préfères)
+
+def segment_series_distance(
+    model,
+    T: int = 16,
+    device: str = "cpu",
+    threshold: float = 0.5,
+    min_duration: int = 3,
+    min_size: int = 20,
+    sigma: float = 0.0,
+    smooth_temporal: bool = False,
+    batch_size: int = 8192,
+    seg_prefix: str = "seg_",
+    folder_name: str = "SEG_distance",
+    seg_mode: str = "L",
+    *,
+    input_folder: str | Path,
+    output_dir: str | Path,
+    ref_mask_path: str | Path,
+):
+    """Version 'distance' branchable depuis l’UI: utilise input_folder/output_dir/ref_mask_path fournis."""
+    from pathlib import Path
+    import numpy as np
+    from PIL import Image
+    from scipy.ndimage import distance_transform_edt, gaussian_filter
+    from skimage.morphology import remove_small_objects
+
+    image_dir = Path(input_folder)
+    out_root  = Path(output_dir)
+    ref_mask_path = Path(ref_mask_path)
+
+    if not image_dir.is_dir():
+        raise ValueError(f"Invalid images folder: {image_dir}")
+    if not ref_mask_path.is_file():
+        raise ValueError(f"Invalid reference mask file: {ref_mask_path}")
+
+    series = load_ir_images(image_dir)  # (T0,H,W)
+    if series.ndim != 3:
+        raise ValueError(f"load_ir_images must return (T,H,W), got {series.shape}")
+    T0, H, W = series.shape
+
+    mask_arr = np.array(Image.open(ref_mask_path).convert("L"))
+    if mask_arr.shape != (H, W):
+        raise ValueError(f"Reference mask {mask_arr.shape} differs from images {(H,W)}.")
+    GA_mask = mask_arr > 0  # True on GA
+
+    # crop/pad temporel
+    if T0 < T:
+        pad = T - T0
+        series_pad = np.concatenate([series, np.zeros((pad, H, W), dtype=series.dtype)], axis=0)
+    else:
+        series_pad = series[:T]
+    T_eff = series_pad.shape[0]
+
+    # pixels valides
+    valid = compute_validity_mask(series_pad, threshold=0)
+    vi, vj = np.where(valid)
+    if vi.size == 0:
+        raise ValueError("No valid pixels found.")
+    N = vi.size
+
+    # distance NON normalisée (0 sur GA)
+    dist_map = distance_transform_edt(~GA_mask).astype(np.float32)
+
+    # features (N,T,2) = [intensity, distance_constante]
+    X = np.empty((N, T_eff, 2), dtype=np.float32)
+    series_f = series_pad.astype(np.float32)  # tes images sont déjà normalisées
+    for k, (i, j) in enumerate(zip(vi, vj)):
+        X[k, :, 0] = series_f[:, i, j]
+        X[k, :, 1] = dist_map[i, j]
+
+    # inférence
+    probs = predict_on_subseries(
+        model, X, device=device, smooth=smooth_temporal,
+        batch_size=batch_size, return_proba=True
+    )[:, :T_eff]
+
+    # binarisation + min_duration
+    y_bin = (probs >= float(threshold)).astype(np.uint8)
+    if min_duration and min_duration > 1:
+        y_bin = enforce_min_duration(y_bin, min_duration)
+
+    # reprojection
+    prob_cube = np.zeros((T_eff, H, W), dtype=np.float32)
+    bin_cube  = np.zeros((T_eff, H, W), dtype=bool)
+    for t in range(T_eff):
+        prob_cube[t, vi, vj] = probs[:, t]
+        bin_cube[t,  vi, vj] = y_bin[:, t].astype(bool)
+
+    # lissage spatial + min_size
+    masks_bin = np.zeros_like(bin_cube)
+    for t in range(T_eff):
+        frame_bin = bin_cube[t]
+        if sigma and sigma > 0:
+            smoothed = gaussian_filter(prob_cube[t], sigma=sigma)
+            frame_bin = smoothed >= threshold
+        if min_size and min_size > 0:
+            frame_bin = remove_small_objects(frame_bin, min_size=min_size)
+        masks_bin[t] = frame_bin
+
+    # supprimer padding (⚠️ sans +1)
+    masks_bin = masks_bin[:T0]
+
+    # sauvegarde
+    outdir = out_root / folder_name
+    outdir.mkdir(parents=True, exist_ok=True)
+    for t in range(T0):
+        arr = (masks_bin[t].astype(np.uint8) * 255)
+        img = Image.fromarray(arr, mode="L")
+        if seg_mode == "1":
+            img = img.convert("1")
+        img.save(outdir / f"{seg_prefix}{t+1:04d}.png")
+
+    print(f"{T0} segmentations saved in folder: {outdir}")
+    return str(outdir)
